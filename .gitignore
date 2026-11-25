@@ -1,0 +1,15 @@
+# Local files that never belong in the repository.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!terraform.tfvars.example
+tfplan
+*.tfplan
+crash.log
+.build/
+*.zip
+# Access key files from scripts/sync-user-keys.sh, and other key material.
+*keys*.json
+*.pem
+.env*

@@ -1,0 +1,142 @@
+#!/bin/bash
+# First boot for the Acme Orders lab. Works on RHEL 9 and Amazon Linux 2023.
+# Installs Podman, fetches the app bundle from S3, builds the image, and starts
+# the web front end and Postgres under the acme-orders systemd unit.
+set -euo pipefail
+exec > >(tee -a /var/log/acme-orders-setup.log) 2>&1
+
+retry() {
+  local n=0
+  until "$@"; do
+    n=$((n + 1))
+    if [ "$n" -ge 10 ]; then return 1; fi
+    sleep 15
+  done
+}
+
+retry dnf install -y podman python3
+
+install -d -m 0755 /opt/acme-orders /etc/acme-orders
+
+# Where the app bundle lives. Read by acme-orders-build.
+cat > /etc/acme-orders/bundle.conf <<'EOF'
+BUNDLE_URL=${bundle_url}
+BUNDLE_REGION=${region}
+AWS_CLI_IMAGE=${aws_cli_image}
+EOF
+
+# App settings. Change one later with: sudo /usr/local/bin/acme-orders-set KEY VALUE
+# (RHEL sudo secure_path leaves out /usr/local/bin, so give the full path.)
+install -m 0640 /dev/null /etc/acme-orders/acme.env
+cat > /etc/acme-orders/acme.env <<'EOF'
+VAULT_ADDR=${vault_addr}
+VAULT_NAMESPACE=${vault_namespace}
+AWS_REGION=${region}
+KVS_AWS_SECRET_NAME=${aws_secret_name}
+KVS_IAM_SERVER_ID=${iam_server_id}
+KVS_IAM_STS_REGION=${iam_sts_region}
+EOF
+
+# Fetch the bundle with the instance role and build the image.
+cat > /usr/local/bin/acme-orders-build <<'EOF'
+#!/bin/bash
+set -euo pipefail
+# shellcheck source=/dev/null
+. /etc/acme-orders/bundle.conf
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+podman run --rm -v "$work:/out:Z" -e AWS_REGION="$BUNDLE_REGION" \
+  "$AWS_CLI_IMAGE" s3 cp --only-show-errors "$BUNDLE_URL" /out/app.zip
+rm -rf /opt/acme-orders/app.new
+python3 -m zipfile -e "$work/app.zip" /opt/acme-orders/app.new
+chmod 0755 /opt/acme-orders/app.new/rotate
+rm -rf /opt/acme-orders/app
+mv /opt/acme-orders/app.new /opt/acme-orders/app
+podman build -t localhost/acme-orders:latest /opt/acme-orders/app
+EOF
+
+# Same services as the app's compose.yaml, run with plain podman.
+# "acme-orders-up web" restarts only the web container.
+cat > /usr/local/bin/acme-orders-up <<'EOF'
+#!/bin/bash
+set -euo pipefail
+podman network exists acme || podman network create acme
+if [ "$${1:-all}" != "web" ]; then
+  podman volume exists acme-db || podman volume create acme-db
+  podman rm -f acme-db >/dev/null 2>&1 || true
+  # The superuser password is random and never stored, as in compose.yaml.
+  podman run -d --name acme-db --network acme --network-alias db \
+    --restart unless-stopped -e POSTGRES_DB=acme \
+    -v acme-db:/var/lib/postgresql/data \
+    -v /opt/acme-orders/app/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro,Z \
+    --entrypoint sh docker.io/library/postgres:16 \
+    -c 'POSTGRES_PASSWORD="$(head -c 24 /dev/urandom | base64)" exec docker-entrypoint.sh postgres' >/dev/null
+fi
+podman rm -f acme-web >/dev/null 2>&1 || true
+podman run -d --name acme-web --network acme -p 8080:8080 \
+  --restart unless-stopped --env-file /etc/acme-orders/acme.env \
+  -e KVS_DB_HOST=db -e KVS_DB_NAME=acme \
+  --health-cmd "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)\"" \
+  --health-interval 30s --health-timeout 3s \
+  localhost/acme-orders:latest >/dev/null
+EOF
+
+cat > /usr/local/bin/acme-orders-down <<'EOF'
+#!/bin/bash
+podman rm -f acme-web acme-db >/dev/null 2>&1 || true
+EOF
+
+# Change one app setting and restart the web container. The database keeps running.
+cat > /usr/local/bin/acme-orders-set <<'EOF'
+#!/bin/bash
+set -euo pipefail
+key=$${1:-}
+value=$${2-}
+case "$key" in
+  VAULT_ADDR|VAULT_NAMESPACE|AWS_REGION|KVS_AWS_SECRET_NAME|KVS_IAM_SERVER_ID|KVS_IAM_STS_REGION) ;;
+  *) echo "usage: acme-orders-set KVS_AWS_SECRET_NAME|VAULT_ADDR|VAULT_NAMESPACE|AWS_REGION|KVS_IAM_SERVER_ID|KVS_IAM_STS_REGION VALUE" >&2; exit 2 ;;
+esac
+if ! [[ "$value" =~ ^[A-Za-z0-9/_+=.@:-]*$ ]]; then
+  echo "acme-orders-set: value has characters that are not allowed" >&2
+  exit 2
+fi
+tmp=$(mktemp /etc/acme-orders/acme.env.XXXXXX)
+grep -v "^$key=" /etc/acme-orders/acme.env > "$tmp" || true
+echo "$key=$value" >> "$tmp"
+chmod 0640 "$tmp"
+mv "$tmp" /etc/acme-orders/acme.env
+/usr/local/bin/acme-orders-up web
+echo "acme-orders-set: $key updated and the web container restarted"
+EOF
+
+chmod 0755 /usr/local/bin/acme-orders-build /usr/local/bin/acme-orders-up \
+  /usr/local/bin/acme-orders-down /usr/local/bin/acme-orders-set
+
+cat > /etc/systemd/system/acme-orders.service <<'EOF'
+[Unit]
+Description=Acme Orders web front end and database
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/acme-orders-up
+ExecStop=/usr/local/bin/acme-orders-down
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Open the app port if the image runs firewalld.
+if systemctl is-active --quiet firewalld; then
+  firewall-cmd --permanent --add-port=8080/tcp
+  firewall-cmd --reload
+fi
+
+# The instance profile can take a moment to be usable on first boot.
+retry /usr/local/bin/acme-orders-build
+systemctl daemon-reload
+systemctl enable --now acme-orders.service
+echo "acme-orders: setup finished"

@@ -1,0 +1,23 @@
+# Copy to terraform.tfvars (git-ignored) and fill in. No secrets go here.
+image_id      = "ami-0123456789abcdef0"    # your approved RHEL 9 or Amazon Linux 2023 image
+subnet_id     = "subnet-0123456789abcdef0" # a public subnet
+operator_cidr = "198.51.100.7/32"          # your workstation's public IP
+vault_addr    = "https://example.vault.hashicorp.cloud:8200"
+
+# The acme-orders-vault-demo clone, beside this repository. Relative to this terraform folder.
+app_source_dir = "../../acme-orders-vault-demo"
+
+# Optional
+# ssh_key_name        = "my-key"
+# vault_namespace     = "admin/kv-sync-poc"
+# aws_secret_name     = ""        # first boot only, see README.md
+# vault_iam_server_id = ""
+# sync_auth           = "iam_user" # or "wif", or "none" to bring your own sync identity
+# sync_user_name      = "acme-orders-sync"
+# sync_user_permissions_boundary_arn = null # a policy ARN, if your account requires a boundary
+# sync_user_policy_arns = []                # extra managed policy ARNs, if your account requires them
+# wif: the Vault side is proven; the AWS side has not been run end to end.
+# vault_oidc_issuer   = "https://example.vault.hashicorp.cloud:8200/v1/admin/kv-sync-poc/identity/oidc/plugins" # after vault write identity/oidc/config issuer=<Vault public address>
+# vault_oidc_audience = "sts.amazonaws.com" # identity_token_audience on the destination
+# vault_oidc_subject  = "secrets-sync:<namespace path>:aws-sm:<destination name>" # the subject Vault sends, from the live run
+# aws_secret_name_prefix = "vault/app/"
